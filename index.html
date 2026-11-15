@@ -3,11 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#51495E">
 <title>Svatba</title>
 <style>
-  :root { --bg: #51495E; }              /* barva pozadí pod průhlednými snímky */
+  :root { --bg: #51495E; }              /* barva pozadí: průhledné snímky i pruhy po stranách */
   html, body { margin: 0; background: var(--bg); }
-  #stage { position: fixed; inset: 0; overflow: hidden; }
+  #stage { position: fixed; inset: 0; overflow: hidden; background: var(--bg); }
   #stage canvas {
     position: absolute; inset: 0; width: 100%; height: 100%;
     object-fit: contain; display: block; pointer-events: none;
