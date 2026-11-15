@@ -1,13 +1,248 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>wedding</title>
-  </head>
-  <body>
-    <div id="app"></div>
-    <script type="module" src="/src/main.js"></script>
-  </body>
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Svatba</title>
+<style>
+  :root { --bg: #f3efe8; }              /* barva pozadí pod průhlednými snímky */
+  html, body { margin: 0; background: var(--bg); }
+  #stage { position: fixed; inset: 0; overflow: hidden; }
+  #stage canvas {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: contain; display: block; pointer-events: none;
+  }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="main"></canvas>
+  <canvas id="scroll" class="hidden"></canvas>
+  <canvas id="fck" class="hidden"></canvas>
+</div>
+<div id="spacer"></div>
+
+<script>
+(() => {
+  'use strict';
+
+  /* ===== NASTAVENÍ (počty snímků zjištěny z výpisu složek v repozitáři) ===== */
+  const CONFIG = {
+    main:   { dir: 'ANIMACE_MAIN',   prefix: 'Pre-comp 1_', pad: 5, count: 122, cache: 36, loop: false },
+    scroll: { dir: 'ANIMACE_SCROLL', prefix: 'Comp 1_',     pad: 5, count: 134, cache: 30, loop: true  },
+    fck:    { dir: 'ANIMACE_FCK',    prefix: 'Comp 1_',     pad: 5, count: 134, cache: 30, loop: false }
+  };
+  const SCROLL_LENGTH_VH = 600;  // délka scrollu = kolik výšek obrazovky
+  const FPS = 30;                // FPS pomocných animací
+  const IDLE_MS = 1000;          // nečinnost před spuštěním SCROLL animace
+  const SCROLL_LOOPS = 3;
+  const PARALLEL = 6;            // max. souběžných stahování
+
+  /* ===== SEKVENCE: načítání, LRU cache, priorita podle vzdálenosti ===== */
+  class Sequence {
+    constructor(cfg) {
+      this.cfg = cfg;
+      this.cache = new Map();
+      this.loading = new Set();
+      this.failed = new Set();
+      this.wanted = new Set();
+      this.center = 0;
+      this.dead = false;
+      this.onLoad = null;
+    }
+    url(i) {
+      const c = this.cfg;
+      return c.dir + '/' + encodeURIComponent(c.prefix + String(i).padStart(c.pad, '0') + '.webp');
+    }
+    dist(a, b) {
+      const d = Math.abs(a - b);
+      return this.cfg.loop ? Math.min(d, this.cfg.count - d) : d;
+    }
+    get(i) { return this.cache.get(i) || null; }
+    span(c, fwd, back) {
+      const n = this.cfg.count, out = [];
+      for (let k = -back; k <= fwd; k++) {
+        let i = c + k;
+        if (this.cfg.loop) i = ((i % n) + n) % n;
+        if (i >= 0 && i < n) out.push(i);
+      }
+      return out;
+    }
+    // Nastaví, co je aktuálně potřeba. Staré (nezačaté) požadavky se zahazují.
+    want(c, fwd, back) {
+      if (this.dead) return;
+      this.center = c;
+      this.wanted = new Set(this.span(c, fwd, back).filter(i =>
+        !this.cache.has(i) && !this.loading.has(i) && !this.failed.has(i)));
+      this.pump();
+    }
+    pump() {
+      while (!this.dead && this.loading.size < PARALLEL && this.wanted.size) {
+        let best = -1, bd = Infinity;
+        for (const i of this.wanted) {
+          const d = this.dist(i, this.center);
+          if (d < bd) { bd = d; best = i; }
+        }
+        this.wanted.delete(best);
+        this.load(best);
+      }
+    }
+    load(i) {
+      this.loading.add(i);
+      const img = new Image();
+      img.decoding = 'async';
+      img.src = this.url(i);
+      img.decode()
+        .then(() => { if (!this.dead) this.cache.set(i, img); })
+        .catch(() => {
+          this.failed.add(i);
+          setTimeout(() => this.failed.delete(i), 5000);
+        })
+        .finally(() => {
+          this.loading.delete(i);
+          if (this.dead) return;
+          this.evict();
+          if (this.onLoad) this.onLoad(i);
+          this.pump();
+        });
+    }
+    evict() {
+      if (this.cache.size <= this.cfg.cache) return;
+      const keys = [...this.cache.keys()].sort((a, b) => this.dist(b, this.center) - this.dist(a, this.center));
+      while (this.cache.size > this.cfg.cache) this.cache.delete(keys.shift());
+    }
+    destroy() { this.dead = true; this.cache.clear(); this.wanted.clear(); }
+  }
+
+  function draw(canvas, img) {
+    if (canvas.width !== img.naturalWidth || canvas.height !== img.naturalHeight) {
+      canvas.width = img.naturalWidth;
+      canvas.height = img.naturalHeight;
+    }
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);   // zachová alpha
+    ctx.drawImage(img, 0, 0);
+  }
+
+  /* ===== DOM / STAV ===== */
+  const $ = id => document.getElementById(id);
+  const mainCanvas = $('main'), scrollCanvas = $('scroll'), fckCanvas = $('fck');
+  $('spacer').style.height = SCROLL_LENGTH_VH + 'vh';
+
+  const mainSeq = new Sequence(CONFIG.main);
+  const scrollSeq = new Sequence(CONFIG.scroll);
+  const fckSeq = new Sequence(CONFIG.fck);
+
+  let started = false;       // uživatel poprvé scrollnul (nevratné)
+  let idleTimer = null;
+  let players = [];
+  let mainTarget = 0, mainShown = -1, dir = 1, analog = 0;
+  let rafPending = false;
+
+  /* ===== MAIN: snímek přímo podle scroll pozice ===== */
+  function renderMain() {
+    rafPending = false;
+    const t = mainTarget;
+    let idx = t, img = mainSeq.get(t);
+    if (!img) {
+      // cílový snímek ještě není: ukaž nejbližší načtený, ale jen pokud je blíž než aktuální
+      let bd = Infinity;
+      for (const k of mainSeq.cache.keys()) {
+        const d = Math.abs(k - t);
+        if (d < bd) { bd = d; idx = k; }
+      }
+      if (bd === Infinity) return;
+      if (mainShown >= 0 && Math.abs(mainShown - t) <= bd) return;
+      img = mainSeq.get(idx);
+    }
+    if (idx !== mainShown) {
+      draw(mainCanvas, img);
+      const first = mainShown < 0;
+      mainShown = idx;
+      if (first) onFirstFrame();
+    }
+  }
+  function requestRender() {
+    if (!rafPending) { rafPending = true; requestAnimationFrame(renderMain); }
+  }
+  mainSeq.onLoad = requestRender;
+
+  function onScroll() {
+    const max = Math.max(1, document.documentElement.scrollHeight - window.innerHeight);
+    const progress = Math.min(1, Math.max(0, window.scrollY / max));
+    analog = Math.round(progress * 1023);
+    document.documentElement.dataset.analog = analog;
+    const t = Math.round(progress * (CONFIG.main.count - 1));
+    if (t !== mainTarget) { dir = t > mainTarget ? 1 : -1; mainTarget = t; }
+    mainSeq.want(t, dir > 0 ? 14 : 6, dir > 0 ? 6 : 14);
+    requestRender();
+    if (!started && window.scrollY > 0) onFirstScroll();
+  }
+
+  /* ===== POMOCNÉ ANIMACE (SCROLL, FCK) ===== */
+  function play(seq, canvas, loops, onDone) {
+    canvas.classList.remove('hidden');
+    const interval = 1000 / FPS, count = seq.cfg.count;
+    const p = { stop: false, raf: 0 };
+    let frame = -1, last = 0, loop = 0, done = false;
+    function tick(ts) {
+      if (p.stop) return;
+      if (done) {
+        if (ts - last >= interval) { p.stop = true; onDone && onDone(); return; }
+      } else {
+        const next = (frame + 1) % count;
+        seq.want(next, 16, 0);
+        if (frame < 0 || ts - last >= interval) {
+          const img = seq.get(next);          // když chybí, čeká se (nic se nepřeskakuje)
+          if (img) {
+            draw(canvas, img);
+            last = (frame < 0 || ts - last > interval * 2) ? ts : last + interval;
+            frame = next;
+            if (next === count - 1 && ++loop >= loops) done = true;
+          }
+        }
+      }
+      p.raf = requestAnimationFrame(tick);
+    }
+    p.raf = requestAnimationFrame(tick);
+    players.push(p);
+  }
+
+  function onFirstFrame() {
+    if (started) return;
+    scrollSeq.want(0, 20, 0);                 // přednačti začátek pomocných animací
+    fckSeq.want(0, 20, 0);
+    idleTimer = setTimeout(startIdleSequence, IDLE_MS);
+  }
+
+  function startIdleSequence() {
+    if (started || window.scrollY > 0) return;
+    play(scrollSeq, scrollCanvas, SCROLL_LOOPS, () => {
+      scrollCanvas.classList.add('hidden');
+      if (started) return;
+      play(fckSeq, fckCanvas, 1, null);       // zastaví se na posledním snímku
+    });
+  }
+
+  function onFirstScroll() {
+    started = true;                           // už se nikdy nespustí SCROLL ani FCK
+    clearTimeout(idleTimer);
+    players.forEach(p => { p.stop = true; cancelAnimationFrame(p.raf); });
+    players = [];
+    scrollCanvas.classList.add('hidden');
+    fckCanvas.classList.add('hidden');
+    scrollSeq.destroy();                      // uvolni paměť
+    fckSeq.destroy();
+  }
+
+  /* ===== START ===== */
+  if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+  window.scrollTo(0, 0);
+  window.addEventListener('scroll', onScroll, { passive: true });
+  window.addEventListener('resize', onScroll, { passive: true });
+  onScroll();                                 // první snímek MAIN okamžitě
+})();
+</script>
+</body>
 </html>
